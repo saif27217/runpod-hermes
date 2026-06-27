@@ -39,20 +39,24 @@ AVAILABLE_MODELS = [
 
 
 def extract_tool_calls(content):
-    """Parse JSON tool calls out of text content using json.JSONDecoder.
+    """Parse tool calls from model output using json.JSONDecoder for JSON
+    AND regex for Hermes XML format.
 
-    Uses raw_decode() which handles arbitrarily nested JSON properly,
-    unlike the fragile non-greedy regex approach.
+    Handles two formats:
+      1. JSON:  {"name": "tool_name", "arguments": { ... }}
+      2. XML:   <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+
+    Returns (tool_calls_list, clean_content_string).
     """
     if not content:
         return [], content or ""
 
     decoder = json.JSONDecoder()
     tool_calls = []
-    clean_content = ""
+    clean_content = content
     last_idx = 0
 
-    # Find all potential tool call starts: {"name": ...
+    # ── 1. Parse JSON format: {"name": ..., "arguments": ...} ────────────
     pattern = r'\{\s*"name"\s*:'
     for match in re.finditer(pattern, content):
         start = match.start()
@@ -72,7 +76,7 @@ def extract_tool_calls(content):
             else:
                 args_serialized = str(args_val) if args_val is not None else "{}"
 
-            clean_content += content[last_idx:start]
+            clean_content = clean_content.replace(content[start:end], "", 1)
             last_idx = end
 
             tool_calls.append({
@@ -86,7 +90,31 @@ def extract_tool_calls(content):
         except (json.JSONDecodeError, Exception):
             continue
 
-    clean_content += content[last_idx:]
+    # ── 2. Parse Hermes XML format: <tool_call>...</tool_call> ──────────
+    xml_pattern = r'<tool_call>\s*<function=(\w+)>(.*?)</function>\s*</tool_call>'
+    for xml_match in re.finditer(xml_pattern, content, re.DOTALL):
+        func_name = xml_match.group(1)
+        params_block = xml_match.group(2).strip()
+
+        # Parse parameters from multiple XML styles
+        params = {}
+        # Style: <parameter=key>value</parameter>
+        for pm in re.finditer(r'<parameter=(\w+)>(.*?)</parameter>', params_block, re.DOTALL):
+            params[pm.group(1)] = pm.group(2).strip()
+        # Style: <parameter name="key">value</parameter>
+        for pm in re.finditer(r'<parameter\s+name="?(\w+)"?>(.*?)</parameter>', params_block, re.DOTALL):
+            params[pm.group(1)] = pm.group(2).strip()
+
+        tool_calls.append({
+            "id": f"call_{func_name}_{len(tool_calls)}",
+            "type": "function",
+            "function": {
+                "name": func_name,
+                "arguments": json.dumps(params),
+            },
+        })
+        clean_content = clean_content.replace(xml_match.group(0), "", 1)
+
     return tool_calls, clean_content.strip()
 
 
@@ -95,7 +123,15 @@ def inject_tool_instructions(messages, tools):
 
     This tells the model how to express tool calls as JSON text blocks,
     which the proxy then parses and converts to native OpenAI tool_calls format.
+
+    If messages already contain Hermes XML tool calling instructions
+    (<tool_call>), skips injection to avoid format conflicts.
     """
+    # Check if messages already have tool calling instructions
+    all_msg_text = " ".join(m.get("content", "") or "" for m in messages)
+    if re.search(r'<tool_call>', all_msg_text):
+        return messages
+
     tools_desc = []
     for tool in tools:
         if tool.get("type") == "function":
