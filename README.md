@@ -129,6 +129,18 @@ If you're using Hermes Agent with a large timeout setting (≥300s as shown in t
 - **The proxy logs** at `$HOME/.hermes/logs/runpod_proxy.log` show exactly what stage you're in — check there if you're unsure.
 - **For Hermes config**: The `timeout_seconds: 300` and `stale_timeout_seconds: 300` settings give the worker enough time to cold-boot without the client giving up early.
 
+## 🔧 Tool Calling
+
+The proxy converts non-standard text-embedded tool calls into proper OpenAI `tool_calls` format automatically.
+
+| Scenario | What happens |
+|----------|--------------|
+| Model outputs text with a tool call JSON block | Proxy parses it, strips it from content, and returns `finish_reason: "tool_calls"` with structured `tool_calls` array |
+| Model responds normally without tool calls | Returns standard text response with `finish_reason: "stop"` |
+| No tools in request | Behavior unchanged |
+
+Streaming and non-streaming both produce valid OpenAI tool-call chunks.
+
 ## Requirements
 
 - Python 3.11+ (stdlib only — no pip dependencies)

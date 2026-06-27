@@ -82,6 +82,18 @@ RunPod serverless workers sleep after ~15-30 min idle. The **first request** tri
 
 Full details in the [README](README.md#-cold-start-behavior).
 
+## 🔧 Tool Calling
+
+The proxy converts non-standard text-embedded tool calls into proper OpenAI `tool_calls` format automatically.
+
+| Scenario | What happens |
+|----------|--------------|
+| Model outputs text with a tool call JSON block | Proxy parses it, strips it from content, and returns `finish_reason: "tool_calls"` with structured `tool_calls` array |
+| Model responds normally without tool calls | Returns standard text response with `finish_reason: "stop"` |
+| No tools in request | Behavior unchanged |
+
+Streaming and non-streaming both produce valid OpenAI tool-call chunks.
+
 ## Logs
 
 - **`$HOME/.hermes/logs/runpod_proxy.log`**: Check proxy logs for detailed error messages.
