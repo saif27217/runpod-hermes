@@ -86,6 +86,15 @@ Full details in the [README](README.md#-cold-start-behavior).
 
 The proxy converts non-standard text-embedded tool calls into proper OpenAI `tool_calls` format automatically.
 
+| Format | Example |
+|--------|---------|
+| JSON | `{"name": "get_weather", "arguments": {"city": "Tokyo"}}` |
+| Hermes XML | `<tool_call><function=skill_view><parameter=name>skillname</parameter></function></tool_call>` |
+
+Both `<parameter=key>` and `<parameter name="key">` XML styles supported.
+
+**Smart injection**: If messages already contain `<tool_call>` instructions, the proxy skips JSON format injection to avoid conflicts. Otherwise it injects JSON instructions.
+
 | Scenario | What happens |
 |----------|--------------|
 | Model outputs text with a tool call JSON block | Proxy parses it, strips it from content, and returns `finish_reason: "tool_calls"` with structured `tool_calls` array |

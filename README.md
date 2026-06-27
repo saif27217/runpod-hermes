@@ -133,11 +133,24 @@ If you're using Hermes Agent with a large timeout setting (≥300s as shown in t
 
 The proxy converts non-standard text-embedded tool calls into proper OpenAI `tool_calls` format automatically.
 
+### Supported formats
+
+| Format | Example |
+|--------|---------|
+| JSON | `{"name": "get_weather", "arguments": {"city": "Tokyo"}}` |
+| Hermes XML | `<tool_call><function=skill_view><parameter=name>skillname</parameter></function></tool_call>` |
+
+The parser supports both `<parameter=key>value</parameter>` and `<parameter name="key">value</parameter>` XML styles.
+
 | Scenario | What happens |
 |----------|--------------|
-| Model outputs text with a tool call JSON block | Proxy parses it, strips it from content, and returns `finish_reason: "tool_calls"` with structured `tool_calls` array |
+| Model outputs text with a tool call block | Proxy parses it, strips it from content, and returns `finish_reason: "tool_calls"` with structured `tool_calls` array |
 | Model responds normally without tool calls | Returns standard text response with `finish_reason: "stop"` |
 | No tools in request | Behavior unchanged |
+
+### Smart injection
+
+The proxy detects whether messages already contain Hermes XML tool instructions (`<tool_call>`). If yes, it skips the JSON format injection to avoid conflicting instructions — critical for Hermes CLI where the system prompt uses XML format. If no, it injects JSON format instructions.
 
 ### Multi-tool calls
 
