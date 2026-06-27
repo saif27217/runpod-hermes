@@ -1,73 +1,99 @@
 ---
-name: runpod-videogen-hermes
-description: "End-to-end 3:4 video generation via RunPod serverless endpoint. Covers job submission, polling, base64 video retrieval, and verification."
+name: runpod
+description: "RunPod serverless endpoint → OpenAI-compatible proxy for Hermes Agent. Covers proxy setup, Hermes provider config, and troubleshooting."
 version: 1.0.0
 author: Sak + Lazer
-source: https://github.com/saif27217/runpod-videogen-hermes
+source: https://github.com/saif27217/runpod-hermes
 ---
 
-# RunPod Video Generation for Hermes
+# RunPod Provider for Hermes Agent
 
-Generate 3:4 portrait videos via a RunPod serverless endpoint (`cbrzbzlinjhsc0`), poll until completion, download the base64-encoded MP4, and verify the file.
+A local HTTP proxy that translates OpenAI chat completions requests into RunPod endpoint format and maps responses back.
 
-## Files in this repo
+**Repo**: `saif27217/runpod-hermes` — all scripts live there.
 
-| File | Purpose |
-|------|---------|
-| `scripts/rp_submit.py` | Submit a video generation job to RunPod |
-| `scripts/rp_status.py` | Check job status + show output metadata |
-| `scripts/rp_save_video.py` | Download base64 video from completed run and save as MP4 |
-| `scripts/rp_complete_video.sh` | One-shot helper: submit → poll → save |
-| `references/cold-start.md` | RunPod cold-start behavior and retry strategy |
-| `references/api-quirks.md` | RunPod API quirks and response formats |
-
-## Prerequisites
-
-- Python 3.11+ (stdlib only — no pip dependencies)
-- RunPod API key stored at `/tmp/rp.key` (chmod 600)
-- RunPod endpoint ID: `cbrzbzlinjhsc0`
-
-## Quick start
-
-### 1. Submit a job
-```bash
-python3 scripts/rp_submit.py --prompt "Your prompt here"
-```
-
-### 2. Check status
-```bash
-python3 scripts/rp_status.py --run-id <RUN_ID>
-```
-
-### 3. Download the video
-```bash
-python3 scripts/rp_save_video.py --run-id <RUN_ID> --output /path/to/video.mp4
-```
-
-### 4. Or run all-in-one
-```bash
-bash scripts/rp_complete_video.sh --prompt "Your prompt here" --output ./video.mp4
-```
-
-## How it works
-
-1. **Submit** → POST to `/v2/<endpoint>/run` with `{"input": {"prompt": "..."}}`
-2. **Poll** → GET `/v2/<endpoint>/status/<run_id>` every 30–60s
-3. **Download** → `output` field is a huge base64 string containing the MP4
-4. **Verify** → `ffprobe` shows `h264`, `480x720` (portrait)
-
-## Cold start
-
-First request after idle triggers worker boot (~1–2 min). You'll see `IN_QUEUE` → `IN_PROGRESS` → `COMPLETED`. Retry same request after 60–90s if you hit `HTTP 503/502`.
-
-## Verification
+## Setup
 
 ```bash
-ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height \
-  -of default=noprint_wrappers=1 /path/to/video.mp4
+git clone https://github.com/saif27217/runpod-hermes.git ~/runpod-hermes
+cd ~/runpod-hermes
 ```
 
-Expected:
-- `codec_name=h264`
-- `width=480`
-- `height=720`
+### Environment variables
+
+```bash
+export RUNPOD_ENDPOINT="your-endpoint-id"
+export RUNPOD_API_KEY="rpa_..."
+```
+
+### Start the proxy
+
+```bash
+./runpod-start.sh
+# runpod proxy started (pid 12345) on port 8765
+```
+
+### Stop
+
+```bash
+./runpod-stop.sh
+```
+
+## Hermes Provider Config
+
+Add to `~/.hermes/config.yaml`:
+
+```yaml
+providers:
+  runpod:
+    base_url: http://127.0.0.1:8765/v1
+    api_key: "placeholder"
+    request_timeout_seconds: 300
+    stale_timeout_seconds: 300
+    models:
+      qwen-3.6-35b:
+        max_output_tokens: 65536
+        context_length: 131072
+        timeout_seconds: 300
+        stale_timeout_seconds: 300
+```
+
+Usage:
+```bash
+hermes chat -m qwen-3.6-35b --provider runpod -q "hi"
+```
+
+## Response Types
+
+| `stream` param | RunPod endpoint | What proxy returns |
+|----------------|-----------------|--------------------|
+| `false` | `/runsync` | JSON (OpenAI format) |
+| `true` | `/runsync` | SSE stream with `reasoning_content` normalised to `content` |
+
+## Troubleshooting
+
+- **"empty stream with no finish_reason"**: Model context too small. Check RunPod response via `curl` to confirm.
+- **"502 RunPod upstream error"**: Worker cold start. Wait 1-2 minutes and retry.
+- **"IN_QUEUE" / "IN_PROGRESS"**: Worker starting. Proxy returns 503.
+
+## ❄️ Cold Start
+
+RunPod serverless workers sleep after ~15-30 min idle. The **first request** triggers a cold boot taking **1–2 minutes** — expect `HTTP 503` or `502` initially. Just wait 60–90s and retry the same request. Subsequent requests complete in 2–4s.
+
+Full details in the [README](README.md#-cold-start-behavior).
+
+## 🔧 Tool Calling
+
+The proxy converts non-standard text-embedded tool calls into proper OpenAI `tool_calls` format automatically.
+
+| Scenario | What happens |
+|----------|--------------|
+| Model outputs text with a tool call JSON block | Proxy parses it, strips it from content, and returns `finish_reason: "tool_calls"` with structured `tool_calls` array |
+| Model responds normally without tool calls | Returns standard text response with `finish_reason: "stop"` |
+| No tools in request | Behavior unchanged |
+
+Streaming and non-streaming both produce valid OpenAI tool-call chunks.
+
+## Logs
+
+- **`$HOME/.hermes/logs/runpod_proxy.log`**: Check proxy logs for detailed error messages.
