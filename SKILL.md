@@ -92,7 +92,7 @@ The proxy converts non-standard text-embedded tool calls into proper OpenAI `too
 | Model responds normally without tool calls | Returns standard text response with `finish_reason: "stop"` |
 | No tools in request | Behavior unchanged |
 
-Streaming and non-streaming both produce valid OpenAI tool-call chunks.
+Multi-tool calls are supported. Each tool call index gets two SSE chunks (name + arguments) matching the OpenAI spec.
 
 ## Logs
 

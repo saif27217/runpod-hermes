@@ -139,7 +139,34 @@ The proxy converts non-standard text-embedded tool calls into proper OpenAI `too
 | Model responds normally without tool calls | Returns standard text response with `finish_reason: "stop"` |
 | No tools in request | Behavior unchanged |
 
-Streaming and non-streaming both produce valid OpenAI tool-call chunks.
+### Multi-tool calls
+
+The proxy supports multiple tool calls in a single response. The instruction injection tells the model it can output multiple JSON objects, and the parser handles all of them.
+
+**Streaming format**: Each tool call index gets two SSE chunks:
+1. Name/ID chunk (`{"name": "tool_name", "arguments": ""}`)
+2. Arguments chunk (`{"arguments": "..."}`)
+
+This matches the OpenAI streaming spec exactly, so Hermes/openai client SDK accumulates tool calls correctly by index.
+
+### Known limitations & fixes
+
+| Issue | Fix |
+|-------|-----|
+| Model only outputs one tool call | Instruction changed from "a single JSON object" to "one or more JSON objects" |
+| Streaming breaks with multiple tool calls | Tool call indices now streamed separately per OpenAI spec |
+| Tool calls in `reasoning_content` are missed | Proxy now checks both `content` and `reasoning_content` |
+| `GET /v1/models` returns 501 | Proxy now serves the model list at `/v1/models`, `/models`, `/api/v1/models` |
+| Fragile regex breaks on nested JSON in arguments | Now uses `json.JSONDecoder.raw_decode()` for proper brace matching |
+
+### How it works
+
+1. The proxy intercepts the `tools` parameter from the OpenAI request
+2. Injects a system instruction telling the model to output tool calls as raw JSON objects at the end of its response
+3. Sends the modified request to RunPod (always non-streaming, to avoid timeouts)
+4. Parses the response using `json.JSONDecoder.raw_decode()` to find all tool call JSON objects
+5. Strips the JSON from `content` and formats as OpenAI `tool_calls`
+6. For streaming requests: sends correct SSE chunks with per-index tool call deltas + finish_reason
 
 ## Requirements
 

@@ -8,6 +8,9 @@ generation (~30s+), causing Hermes client timeouts. Instead, this proxy
 always requests stream=false from RunPod (completes in ~1-2s), then
 streams the chunks back to Hermes as SSE.
 
+Supports tool calling via instruction injection + parser (for models
+like Qwen that don't natively output OpenAI tool_calls format on llama.cpp).
+
 Env vars:
   RUNPOD_API_KEY  - RunPod API key (required)
   RUNPOD_ENDPOINT - RunPod endpoint ID (required)
@@ -23,48 +26,76 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+# ── Model listing ────────────────────────────────────────────────────────────
+# Models this endpoint supports. Hermes sometimes queries GET /v1/models.
+AVAILABLE_MODELS = [
+    {
+        "id": "qwen-3.6-35b",
+        "object": "model",
+        "created": 1710000000,
+        "owned_by": "runpod",
+    },
+]
+
 
 def extract_tool_calls(content):
-    """Parse JSON tool calls out of text content."""
-    # Regex to find JSON-like structures that match {"name": "...", "arguments": {...}}
-    pattern = r'(?:```json\s*)?\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\}|"[^"]*")\s*\}(?:\s*```)?'
-    matches = re.finditer(pattern, content, re.DOTALL)
+    """Parse JSON tool calls out of text content using json.JSONDecoder.
+
+    Uses raw_decode() which handles arbitrarily nested JSON properly,
+    unlike the fragile non-greedy regex approach.
+    """
+    if not content:
+        return [], content or ""
+
+    decoder = json.JSONDecoder()
     tool_calls = []
-    last_idx = 0
     clean_content = ""
-    for match in matches:
-        name = match.group(1)
-        args_str = match.group(2)
-        
-        # Verify if it's valid JSON
+    last_idx = 0
+
+    # Find all potential tool call starts: {"name": ...
+    pattern = r'\{\s*"name"\s*:'
+    for match in re.finditer(pattern, content):
+        start = match.start()
         try:
-            if args_str.startswith('"'):
-                args = json.loads(args_str)
+            obj, end = decoder.raw_decode(content, start)
+            if not isinstance(obj, dict):
+                continue
+            name = obj.get("name")
+            args_val = obj.get("arguments")
+            if not isinstance(name, str) or not name:
+                continue
+            # Serialise arguments (must be a JSON string for OpenAI format)
+            if isinstance(args_val, (dict, list)):
+                args_serialized = json.dumps(args_val)
+            elif isinstance(args_val, str):
+                args_serialized = args_val
             else:
-                args = json.loads(args_str)
-            
-            args_serialized = json.dumps(args)
-            
-            clean_content += content[last_idx:match.start()]
-            last_idx = match.end()
-            
+                args_serialized = str(args_val) if args_val is not None else "{}"
+
+            clean_content += content[last_idx:start]
+            last_idx = end
+
             tool_calls.append({
                 "id": f"call_{name}_{len(tool_calls)}",
                 "type": "function",
                 "function": {
                     "name": name,
-                    "arguments": args_serialized
-                }
+                    "arguments": args_serialized,
+                },
             })
-        except Exception:
-            pass
-            
+        except (json.JSONDecodeError, Exception):
+            continue
+
     clean_content += content[last_idx:]
     return tool_calls, clean_content.strip()
 
 
 def inject_tool_instructions(messages, tools):
-    """Format tools schema and inject into the system message."""
+    """Format tool schemas and inject instructions into the system message.
+
+    This tells the model how to express tool calls as JSON text blocks,
+    which the proxy then parses and converts to native OpenAI tool_calls format.
+    """
     tools_desc = []
     for tool in tools:
         if tool.get("type") == "function":
@@ -72,41 +103,63 @@ def inject_tool_instructions(messages, tools):
             tools_desc.append({
                 "name": fn.get("name"),
                 "description": fn.get("description", ""),
-                "parameters": fn.get("parameters", {})
+                "parameters": fn.get("parameters", {}),
             })
-            
+
     instructions = (
         "\n\n[TOOL USE INSTRUCTION]\n"
         "You have access to the following tools that you can call:\n"
         f"{json.dumps(tools_desc, indent=2)}\n\n"
-        "To call a tool, you MUST output a single JSON object at the very end of your response in this exact format:\n"
-        "{\"name\": \"tool_name\", \"arguments\": { ... }}\n"
-        "Example:\n"
-        "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n"
-        "Do not output anything after the JSON object. If you do not need to call a tool, just answer normally without outputting JSON."
+        "When you decide to use a tool, you MUST output it as a raw JSON object "
+        "on its own line(s) with no surrounding text on that line, in this exact format:\n"
+        '{"name": "tool_name", "arguments": { ... }}\n'
+        "You can call MULTIPLE tools — just output each one on its own line.\n"
+        "Examples:\n"
+        '{"name": "get_weather", "arguments": {"city": "Tokyo"}}\n'
+        '{"name": "search_web", "arguments": {"query": "Tokyo weather"}}\n'
+        "You may include text BEFORE the tool call JSON objects, but nothing after.\n"
+        "If you do not need to call a tool, just answer normally without outputting JSON."
     )
-    
+
     new_messages = [dict(m) for m in messages]
-    
-    # Find system message
+
+    # Find or create a system message
     system_msg = None
     for msg in new_messages:
         if msg.get("role") == "system":
             system_msg = msg
             break
-            
+
     if system_msg:
         system_msg["content"] = system_msg.get("content", "") + instructions
     else:
         new_messages.insert(0, {
             "role": "system",
-            "content": "You are a helpful assistant with access to tools. Use them when appropriate." + instructions
+            "content": "You are a helpful assistant with access to tools. Use them when appropriate." + instructions,
         })
-        
+
     return new_messages
 
 
 class Handler(BaseHTTPRequestHandler):
+    model_id = "qwen-3.6-35b"
+
+    # ── GET: model listing ─────────────────────────────────────────────
+    def do_GET(self):
+        if self.path in ("/v1/models", "/models", "/api/v1/models"):
+            body = json.dumps({
+                "object": "list",
+                "data": AVAILABLE_MODELS,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_error(404, f"Not Found: {self.path}")
+
+    # ── POST: chat completions ─────────────────────────────────────────
     def do_POST(self):
         if self.path != "/v1/chat/completions":
             self.send_error(404, "Not Found")
@@ -213,27 +266,34 @@ class Handler(BaseHTTPRequestHandler):
                 }],
             }
 
-        # Extract message and content
+        # Extract message content (check both content and reasoning_content)
         choice = openai_resp.get("choices", [{}])[0]
         message = choice.get("message", {})
-        content = message.get("content", "")
-        reasoning = message.get("reasoning_content", "")
+        content = message.get("content", "") or ""
+        reasoning = message.get("reasoning_content", "") or ""
         model_id = openai_resp.get("model", openai_req.get("model", "runpod-model"))
         resp_id = openai_resp.get("id", f"chatcmpl-runpod-{int(time.time())}")
         created = openai_resp.get("created", int(time.time()))
 
-        # Parse tool calls from content if tools are active
+        # Some Qwen/DeepSeek models put everything in reasoning_content
+        all_text = content or reasoning
+
+        # Parse tool calls from text if tools are active
         tool_calls = []
-        if has_tools and content:
-            tool_calls, clean_content = extract_tool_calls(content)
+        if has_tools and all_text:
+            tool_calls, clean_content = extract_tool_calls(all_text)
             if tool_calls:
                 content = clean_content
                 message["content"] = clean_content
                 message["tool_calls"] = tool_calls
                 choice["finish_reason"] = "tool_calls"
 
+                # Also null out reasoning_content when we found tool calls
+                if reasoning:
+                    message.pop("reasoning_content", None)
+
+        # ── Streaming response ──────────────────────────────────────────────
         if stream:
-            # Stream as SSE
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -252,10 +312,9 @@ class Handler(BaseHTTPRequestHandler):
                     "finish_reason": None,
                 }],
             }
-            self.wfile.write(("data: " + json.dumps(role_chunk) + "\n\n").encode())
-            self.wfile.flush()
+            self._sse_send(role_chunk)
 
-            # 2. Content chunk (if present)
+            # 2. Content chunk(s) — if there's clean text before tool calls
             if content:
                 content_chunk = {
                     "id": resp_id,
@@ -268,36 +327,55 @@ class Handler(BaseHTTPRequestHandler):
                         "finish_reason": None,
                     }],
                 }
-                self.wfile.write(("data: " + json.dumps(content_chunk) + "\n\n").encode())
-                self.wfile.flush()
+                self._sse_send(content_chunk)
 
-            # 3. Tool calls chunk (if present)
+            # 3. Tool call chunks — one per tool call index, per OpenAI spec
             if tool_calls:
-                tool_chunk = {
-                    "id": resp_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_id,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [
-                                {
+                for idx, tc in enumerate(tool_calls):
+                    # 3a. Name / id / type chunk for this tool call index
+                    name_chunk = {
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
                                     "index": idx,
                                     "id": tc["id"],
                                     "type": "function",
                                     "function": {
                                         "name": tc["function"]["name"],
-                                        "arguments": tc["function"]["arguments"]
-                                    }
-                                } for idx, tc in enumerate(tool_calls)
-                            ]
-                        },
-                        "finish_reason": None,
-                    }],
-                }
-                self.wfile.write(("data: " + json.dumps(tool_chunk) + "\n\n").encode())
-                self.wfile.flush()
+                                        "arguments": "",
+                                    },
+                                }],
+                            },
+                            "finish_reason": None,
+                        }],
+                    }
+                    self._sse_send(name_chunk)
+
+                    # 3b. Arguments chunk for this tool call index
+                    args_chunk = {
+                        "id": resp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": idx,
+                                    "function": {
+                                        "arguments": tc["function"]["arguments"],
+                                    },
+                                }],
+                            },
+                            "finish_reason": None,
+                        }],
+                    }
+                    self._sse_send(args_chunk)
 
             # 4. Finish chunk
             finish_chunk = {
@@ -311,20 +389,24 @@ class Handler(BaseHTTPRequestHandler):
                     "finish_reason": "tool_calls" if tool_calls else "stop",
                 }],
             }
-            self.wfile.write(("data: " + json.dumps(finish_chunk) + "\n\n").encode())
-            self.wfile.flush()
+            self._sse_send(finish_chunk)
 
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             return
 
-        # Non-streaming: return OpenAI chat completion format
+        # ── Non-streaming response ──────────────────────────────────────────
         response_body = json.dumps(openai_resp).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response_body)))
         self.end_headers()
         self.wfile.write(response_body)
+
+    def _sse_send(self, chunk):
+        """Write a single SSE data frame."""
+        self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+        self.wfile.flush()
 
     def log_message(self, format, *args):
         sys.stderr.write("%s - - [%s] %s\n" % (
