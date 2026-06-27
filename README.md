@@ -89,6 +89,46 @@ The proxy uses RunPod's `/runsync` endpoint which handles both streaming and non
 - **IN_QUEUE / IN_PROGRESS**: Returns HTTP 503 (transient — retryable).
 - **No output / timeouts**: Returns 502 with upstream error details.
 
+## ❄️ Cold Start Behavior
+
+This is the #1 source of confusion when using RunPod serverless endpoints. **Read this carefully — it will save you frustration.**
+
+### What happens
+
+When a RunPod serverless endpoint has been idle for a while (typically 15–30 min), the GPU worker goes to sleep. The **first request** after idle triggers a cold boot:
+
+```
+Request → IN_QUEUE (worker waking up) → IN_PROGRESS (loading model) → COMPLETED
+```
+
+This takes **1–2 minutes** on a cold worker. Afterwards, subsequent requests complete in **2–4 seconds** while the worker stays warm.
+
+### What you'll see
+
+| Stage | Proxy response | What's happening |
+|-------|---------------|-----------------|
+| First request on cold worker | `HTTP 503` with `{"error": {"type": "queue_error"}}` | Worker booting, model loading (~40-60s) |
+| Retry during boot | `HTTP 502` `"RunPod upstream error"` | Worker still loading, request timed out |
+| After worker is warm | `HTTP 200` with normal response | Model loaded, works normally |
+
+### How to handle it
+
+**Don't panic.** This is normal, not a broken setup.
+
+1. **Send your first request** — it will almost certainly fail or timeout.
+2. **Wait 60–90 seconds** (go make tea, check your phone).
+3. **Send the same request again** — it will work instantly.
+4. From then on, all requests work normally until the worker goes idle again.
+
+If you're using Hermes Agent with a large timeout setting (≥300s as shown in the config example above), the first request may hang for a while before failing. This is the proxy waiting for the worker to wake up.
+
+### Pro tips
+
+- **Warm it up first**: Send a short test request (`"hi"` or `"ping"`) before your real work. Wait for success, then proceed.
+- **Keep it warm**: RunPod keeps the worker alive ~15-30 min after the last request. Frequent use means no cold starts.
+- **The proxy logs** at `$HOME/.hermes/logs/runpod_proxy.log` show exactly what stage you're in — check there if you're unsure.
+- **For Hermes config**: The `timeout_seconds: 300` and `stale_timeout_seconds: 300` settings give the worker enough time to cold-boot without the client giving up early.
+
 ## Requirements
 
 - Python 3.11+ (stdlib only — no pip dependencies)

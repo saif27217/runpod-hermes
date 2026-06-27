@@ -75,4 +75,13 @@ hermes chat -m qwen-3.6-35b --provider runpod -q "hi"
 - **"empty stream with no finish_reason"**: Model context too small. Check RunPod response via `curl` to confirm.
 - **"502 RunPod upstream error"**: Worker cold start. Wait 1-2 minutes and retry.
 - **"IN_QUEUE" / "IN_PROGRESS"**: Worker starting. Proxy returns 503.
+
+## ❄️ Cold Start
+
+RunPod serverless workers sleep after ~15-30 min idle. The **first request** triggers a cold boot taking **1–2 minutes** — expect `HTTP 503` or `502` initially. Just wait 60–90s and retry the same request. Subsequent requests complete in 2–4s.
+
+Full details in the [README](README.md#-cold-start-behavior).
+
+## Logs
+
 - **`$HOME/.hermes/logs/runpod_proxy.log`**: Check proxy logs for detailed error messages.
