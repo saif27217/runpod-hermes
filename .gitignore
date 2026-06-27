@@ -1,6 +1,4 @@
-*.pyc
-__pycache__/
-*.pid
-*.log
-.env
+*.mp4
 *.key
+__pycache__/
+*.pyc
