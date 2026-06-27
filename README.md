@@ -1,151 +1,37 @@
-# RunPod Hermes
+# runpod-videogen-hermes
 
-RunPod serverless endpoint → OpenAI-compatible proxy for [Hermes Agent](https://hermes-agent.nousresearch.com).
+End-to-end 3:4 video generation via RunPod serverless endpoint for Hermes Agent.
 
-Enables Hermes Agent to use RunPod serverless GPU endpoints as a custom model provider.
+## What it does
 
-## Architecture
+- Submit video generation jobs to a RunPod endpoint
+- Poll until completion
+- Download base64-encoded MP4
+- Verify video properties
 
-```
-Hermes Agent  →  runpod_proxy.py  →  RunPod API (/runsync)
-(OpenAI SDK)     (127.0.0.1:8765)    (serverless GPU endpoint)
-```
+## Endpoint
 
-The proxy translates OpenAI chat completions requests into RunPod's endpoint format and maps responses back. Both streaming and non-streaming paths are supported.
+`cbrzbzlinjhsc0`
 
-## Files
-
-| File | Purpose |
-|------|---------|
-| `runpod_proxy.py` | HTTP proxy server (stdlib only — no dependencies) |
-| `runpod-start.sh` | Start the proxy daemon |
-| `runpod-stop.sh`  | Stop the proxy daemon |
-
-## Quick Start
-
-### 1. Set up RunPod
+## Quick start
 
 ```bash
-export RUNPOD_API_KEY="rpa_..."    # Your RunPod API key
-export RUNPOD_ENDPOINT="endpoint_id"  # Serverless endpoint ID
-export PROXY_PORT=8765              # Optional, default 8765
+python3 scripts/rp_submit.py --prompt "Your prompt"
+python3 scripts/rp_status.py --run-id <RUN_ID>
+python3 scripts/rp_save_video.py --run-id <RUN_ID> --output ./video.mp4
 ```
 
-### 2. Start the proxy
-
+Or all-in-one:
 ```bash
-./runpod-start.sh
+bash scripts/rp_complete_video.sh --prompt "Your prompt" --output ./video.mp4
 ```
 
-The script reads `RUNPOD_API_KEY` and `RUNPOD_ENDPOINT` as environment variables and writes the PID to `$HOME/.hermes/runpod_proxy.pid`.
+## Prerequisites
 
-### 3. Test with curl
+- Python 3.11+ (stdlib only)
+- RunPod API key at `/tmp/rp.key`
 
-```bash
-# Non-streaming
-curl -s http://127.0.0.1:8765/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"hi"}],"model":"qwen-3.6-35b","stream":false}'
+## Verified output
 
-# Streaming
-curl -s -N http://127.0.0.1:8765/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"hi"}],"model":"qwen-3.6-35b","stream":true}'
-```
-
-### 4. Add to Hermes config
-
-```yaml
-# ~/.hermes/config.yaml
-providers:
-  runpod:
-    base_url: http://127.0.0.1:8765/v1
-    api_key: "placeholder"  # Not checked by local proxy
-    request_timeout_seconds: 300
-    stale_timeout_seconds: 300
-    models:
-      qwen-3.6-35b:
-        max_output_tokens: 65536
-        context_length: 131072
-        timeout_seconds: 300
-        stale_timeout_seconds: 300
-```
-
-Then use:
-```bash
-hermes chat -m qwen-3.6-35b --provider runpod
-```
-
-## How It Works
-
-The proxy uses RunPod's `/runsync` endpoint which handles both streaming and non-streaming responses:
-
-- **Non-streaming** (`stream: false`): Returns RunPod's structured JSON response (list of OpenAI-style completion objects).
-- **Streaming** (`stream: true`): RunPod returns a JSON object containing a list of SSE event strings. The proxy parses these, normalizes `reasoning_content` to `content` (for models like Qwen that use `reasoning_content`), and streams them back as standard SSE.
-
-### Error handling
-
-- **FAILED status**: Returns HTTP 400 with RunPod's error message (e.g., context size exceeded).
-- **IN_QUEUE / IN_PROGRESS**: Returns HTTP 503 (transient — retryable).
-- **No output / timeouts**: Returns 502 with upstream error details.
-
-## ❄️ Cold Start Behavior
-
-This is the #1 source of confusion when using RunPod serverless endpoints. **Read this carefully — it will save you frustration.**
-
-### What happens
-
-When a RunPod serverless endpoint has been idle for a while (typically 15–30 min), the GPU worker goes to sleep. The **first request** after idle triggers a cold boot:
-
-```
-Request → IN_QUEUE (worker waking up) → IN_PROGRESS (loading model) → COMPLETED
-```
-
-This takes **1–2 minutes** on a cold worker. Afterwards, subsequent requests complete in **2–4 seconds** while the worker stays warm.
-
-### What you'll see
-
-| Stage | Proxy response | What's happening |
-|-------|---------------|-----------------|
-| First request on cold worker | `HTTP 503` with `{"error": {"type": "queue_error"}}` | Worker booting, model loading (~40-60s) |
-| Retry during boot | `HTTP 502` `"RunPod upstream error"` | Worker still loading, request timed out |
-| After worker is warm | `HTTP 200` with normal response | Model loaded, works normally |
-
-### How to handle it
-
-**Don't panic.** This is normal, not a broken setup.
-
-1. **Send your first request** — it will almost certainly fail or timeout.
-2. **Wait 60–90 seconds** (go make tea, check your phone).
-3. **Send the same request again** — it will work instantly.
-4. From then on, all requests work normally until the worker goes idle again.
-
-If you're using Hermes Agent with a large timeout setting (≥300s as shown in the config example above), the first request may hang for a while before failing. This is the proxy waiting for the worker to wake up.
-
-### Pro tips
-
-- **Warm it up first**: Send a short test request (`"hi"` or `"ping"`) before your real work. Wait for success, then proceed.
-- **Keep it warm**: RunPod keeps the worker alive ~15-30 min after the last request. Frequent use means no cold starts.
-- **The proxy logs** at `$HOME/.hermes/logs/runpod_proxy.log` show exactly what stage you're in — check there if you're unsure.
-- **For Hermes config**: The `timeout_seconds: 300` and `stale_timeout_seconds: 300` settings give the worker enough time to cold-boot without the client giving up early.
-
-## 🔧 Tool Calling
-
-The proxy converts non-standard text-embedded tool calls into proper OpenAI `tool_calls` format automatically.
-
-| Scenario | What happens |
-|----------|--------------|
-| Model outputs text with a tool call JSON block | Proxy parses it, strips it from content, and returns `finish_reason: "tool_calls"` with structured `tool_calls` array |
-| Model responds normally without tool calls | Returns standard text response with `finish_reason: "stop"` |
-| No tools in request | Behavior unchanged |
-
-Streaming and non-streaming both produce valid OpenAI tool-call chunks.
-
-## Requirements
-
-- Python 3.11+ (stdlib only — no pip dependencies)
-- RunPod serverless endpoint (configured to accept `input.messages` JSON)
-
-## License
-
-MIT
+- Codec: H.264
+- Resolution: 480×720 (portrait, 3:4)
