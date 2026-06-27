@@ -6,10 +6,22 @@ PROMPT="${1:-Your prompt}"
 OUTPUT="${2:-/tmp/runpod_video.mp4}"
 ENDPOINT="${RUNPOD_ENDPOINT:-cbrzbzlinjhsc0}"
 KEY_FILE="${RUNPOD_KEY_FILE:-/tmp/rp.key}"
+WARM_UP="${WARM_UP:-1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Step 0: Warm up the worker if requested or if first run
-if [ "${WARM_UP:-1}" = "1" ]; then
+# Parse flags
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prompt) PROMPT="$2"; shift 2 ;;
+    --output) OUTPUT="$2"; shift 2 ;;
+    --warm-up) WARM_UP="1"; shift ;;
+    --no-warm-up) WARM_UP="0"; shift ;;
+    *) shift ;;
+  esac
+done
+
+# Step 0: Warm up the worker if enabled
+if [ "$WARM_UP" = "1" ]; then
   echo "[0/4] Warming up worker (sending 'hi')..."
   WARM_ID=$(python3 "${SCRIPT_DIR}/rp_submit.py" \
     --prompt "hi" \
