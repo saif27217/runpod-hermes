@@ -16,11 +16,94 @@ Env vars:
 
 import json
 import os
+import re
 import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+
+
+def extract_tool_calls(content):
+    """Parse JSON tool calls out of text content."""
+    # Regex to find JSON-like structures that match {"name": "...", "arguments": {...}}
+    pattern = r'(?:```json\s*)?\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\}|"[^"]*")\s*\}(?:\s*```)?'
+    matches = re.finditer(pattern, content, re.DOTALL)
+    tool_calls = []
+    last_idx = 0
+    clean_content = ""
+    for match in matches:
+        name = match.group(1)
+        args_str = match.group(2)
+        
+        # Verify if it's valid JSON
+        try:
+            if args_str.startswith('"'):
+                args = json.loads(args_str)
+            else:
+                args = json.loads(args_str)
+            
+            args_serialized = json.dumps(args)
+            
+            clean_content += content[last_idx:match.start()]
+            last_idx = match.end()
+            
+            tool_calls.append({
+                "id": f"call_{name}_{len(tool_calls)}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": args_serialized
+                }
+            })
+        except Exception:
+            pass
+            
+    clean_content += content[last_idx:]
+    return tool_calls, clean_content.strip()
+
+
+def inject_tool_instructions(messages, tools):
+    """Format tools schema and inject into the system message."""
+    tools_desc = []
+    for tool in tools:
+        if tool.get("type") == "function":
+            fn = tool.get("function", {})
+            tools_desc.append({
+                "name": fn.get("name"),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {})
+            })
+            
+    instructions = (
+        "\n\n[TOOL USE INSTRUCTION]\n"
+        "You have access to the following tools that you can call:\n"
+        f"{json.dumps(tools_desc, indent=2)}\n\n"
+        "To call a tool, you MUST output a single JSON object at the very end of your response in this exact format:\n"
+        "{\"name\": \"tool_name\", \"arguments\": { ... }}\n"
+        "Example:\n"
+        "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n"
+        "Do not output anything after the JSON object. If you do not need to call a tool, just answer normally without outputting JSON."
+    )
+    
+    new_messages = [dict(m) for m in messages]
+    
+    # Find system message
+    system_msg = None
+    for msg in new_messages:
+        if msg.get("role") == "system":
+            system_msg = msg
+            break
+            
+    if system_msg:
+        system_msg["content"] = system_msg.get("content", "") + instructions
+    else:
+        new_messages.insert(0, {
+            "role": "system",
+            "content": "You are a helpful assistant with access to tools. Use them when appropriate." + instructions
+        })
+        
+    return new_messages
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -44,6 +127,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         stream = openai_req.get("stream", False)
+        tools = openai_req.get("tools", [])
+        has_tools = bool(tools)
+
+        if has_tools:
+            messages = inject_tool_instructions(messages, tools)
 
         endpoint = os.environ.get("RUNPOD_ENDPOINT")
         api_key = os.environ.get("RUNPOD_API_KEY")
@@ -134,15 +222,25 @@ class Handler(BaseHTTPRequestHandler):
         resp_id = openai_resp.get("id", f"chatcmpl-runpod-{int(time.time())}")
         created = openai_resp.get("created", int(time.time()))
 
+        # Parse tool calls from content if tools are active
+        tool_calls = []
+        if has_tools and content:
+            tool_calls, clean_content = extract_tool_calls(content)
+            if tool_calls:
+                content = clean_content
+                message["content"] = clean_content
+                message["tool_calls"] = tool_calls
+                choice["finish_reason"] = "tool_calls"
+
         if stream:
-            # Stream as SSE: first role chunk, then content chunks, then finish
+            # Stream as SSE
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
 
-            # Role chunk
+            # 1. Role chunk
             role_chunk = {
                 "id": resp_id,
                 "object": "chat.completion.chunk",
@@ -157,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(("data: " + json.dumps(role_chunk) + "\n\n").encode())
             self.wfile.flush()
 
-            # Content chunk(s) — send full content in one chunk
+            # 2. Content chunk (if present)
             if content:
                 content_chunk = {
                     "id": resp_id,
@@ -173,7 +271,35 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(("data: " + json.dumps(content_chunk) + "\n\n").encode())
                 self.wfile.flush()
 
-            # Finish chunk
+            # 3. Tool calls chunk (if present)
+            if tool_calls:
+                tool_chunk = {
+                    "id": resp_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": idx,
+                                    "id": tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["function"]["name"],
+                                        "arguments": tc["function"]["arguments"]
+                                    }
+                                } for idx, tc in enumerate(tool_calls)
+                            ]
+                        },
+                        "finish_reason": None,
+                    }],
+                }
+                self.wfile.write(("data: " + json.dumps(tool_chunk) + "\n\n").encode())
+                self.wfile.flush()
+
+            # 4. Finish chunk
             finish_chunk = {
                 "id": resp_id,
                 "object": "chat.completion.chunk",
@@ -182,7 +308,7 @@ class Handler(BaseHTTPRequestHandler):
                 "choices": [{
                     "index": 0,
                     "delta": {},
-                    "finish_reason": "stop",
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
                 }],
             }
             self.wfile.write(("data: " + json.dumps(finish_chunk) + "\n\n").encode())
